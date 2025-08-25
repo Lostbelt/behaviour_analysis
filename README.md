@@ -4,7 +4,7 @@ A GUI application for **YOLO Pose** inference on batches of videos, with **annot
 Runs data-parallel across videos, preserves video aspect ratio, and avoids Qt geometry glitches.
 
 <div align="center">
-  <img src="runs/figures/main_window.png" width="600"/>
+  <img src="figures/main_window.png" width="600"/>
 </div>
 
 ---
