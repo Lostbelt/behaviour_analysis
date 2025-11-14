@@ -1,31 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-Behavior Pipeline UI (PySide6) — single-frame YOLO pose, data-parallel over videos,
-annotated video rendering, stats & RF classifier (robust to tiny datasets).
-
-What’s new vs your last version (geometry/min-size fixes included):
-- threading.Thread workers (no QThread). True data parallel: N workers => N video shards.
-- Single-frame inference only (no batching UI/logic).
-- Default conf = 0.50; model warm-up on load.
-- Draw keypoints + bbox on output frames; write annotated .mp4 and show it.
-- Preserve video aspect ratio on playback.
-- Fixed QTextCursor End usage in logger.
-- Auto CPU fallback on torchvision::nms CUDA error.
-- Classifier handles class count < 2 (no crash).
-- **Geometry fixes to stop window from growing uncontrollably**.
-- **Keypoints are filtered by confidence using the same conf value**.
-- **Null-pixmap guards** to fix: QPixmap::scaled: Pixmap is a null pixmap.
-
-Dependencies: PySide6, ultralytics, opencv-python, numpy, pandas, scikit-learn, shap (optional),
-              matplotlib, seaborn, scipy, statsmodels, tqdm
-Run: python behav_ano_fixed_v2.py
-"""
-
 import os
 import sys
 import glob
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
@@ -36,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from PySide6.QtCore import (Qt, QTimer)
-from PySide6.QtGui import (QAction, QImage, QPixmap, QTextCursor)
+from PySide6.QtGui import (QImage, QPixmap, QTextCursor)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QDockWidget, QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QListWidget,
@@ -44,45 +20,18 @@ from PySide6.QtWidgets import (
     QGroupBox, QTableWidget, QTableWidgetItem, QAbstractScrollArea,
     QSizePolicy, QAbstractItemView
 )
+import torch
 
-# ==== Optional imports ====
-try:
-    import torch
-    TORCH_OK = True
-except Exception:
-    TORCH_OK = False
+from ultralytics import YOLO
 
-try:
-    from ultralytics import YOLO
-    ULTRA_OK = True
-except Exception:
-    ULTRA_OK = False
+import matplotlib.pyplot as plt
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # headless render
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from scipy.stats import mannwhitneyu
-    from statsmodels.stats.multitest import multipletests
-    MPL_OK = True
-except Exception:
-    MPL_OK = False
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.ensemble import RandomForestClassifier
 
-try:
-    from sklearn.preprocessing import StandardScaler, LabelEncoder
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score, classification_report
-    from sklearn.ensemble import RandomForestClassifier
-    SK_OK = True
-except Exception:
-    SK_OK = False
-
-try:
-    import shap
-    SHAP_OK = True
-except Exception:
-    SHAP_OK = False
+import shap
 
 
 # ======== Helpers & constants ========
@@ -101,26 +50,6 @@ def list_videos_in_folder(folder: str) -> List[str]:
             seen.add(p)
             out.append(p)
     return out
-
-
-def human_bytes(n):
-    units = ["B","KB","MB","GB","TB"]
-    i = 0
-    v = float(n)
-    while v >= 1024 and i < len(units)-1:
-        v /= 1024.0
-        i += 1
-    return f"{v:.1f} {units[i]}"
-
-
-def estimate_workers_by_vram(per_worker_gb: float, reserve_gb: float = 1.0) -> int:
-    if not TORCH_OK or not torch.cuda.is_available():
-        return max(1, (os.cpu_count() or 4) // 2)
-    total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    usable = max(total - reserve_gb, 0.5)
-    if per_worker_gb <= 0:
-        per_worker_gb = 2.0
-    return max(1, int(usable // per_worker_gb))
 
 
 def safe_ultra_predict(model, frame, conf, device, on_cuda_error_fallback_cpu=True, log_cb=None):
@@ -177,6 +106,48 @@ def render_overlay(video_path: str, predictions: List[dict], out_path: str, fps:
         idx += 1
     cap.release()
     writer.release()
+
+
+def extract_primary_detection(result, conf: float):
+    """Return the left-most detection dict or [] without relying on try/except."""
+    if result is None:
+        return []
+
+    keypoints = getattr(result, "keypoints", None)
+    boxes = getattr(result, "boxes", None)
+    if keypoints is None or getattr(keypoints, "conf", None) is None:
+        return []
+
+    data = getattr(keypoints, "data", None)
+    if data is None:
+        return []
+
+    kp_tensor = data.to('cpu') if hasattr(data, 'to') else data
+    kp_np = kp_tensor.numpy() if hasattr(kp_tensor, 'numpy') else np.asarray(kp_tensor)
+    if kp_np.ndim != 3 or kp_np.shape[0] == 0:
+        return []
+
+    mean_x = kp_np[:, :, 0].mean(axis=1)
+    kp_idx = int(np.argmin(mean_x))
+    kp_arr = kp_np[kp_idx]
+    if kp_arr.ndim != 2 or kp_arr.shape[0] == 0:
+        return []
+
+    mask = kp_arr[:, 2] >= float(conf)
+    filtered = kp_arr[mask]
+    keypoints_out = filtered if filtered.size else kp_arr
+
+    bbox = None
+    if boxes is not None and getattr(boxes, 'xyxy', None) is not None:
+        bbox_tensor = boxes.xyxy.to('cpu') if hasattr(boxes.xyxy, 'to') else boxes.xyxy
+        bbox_np = bbox_tensor.numpy() if hasattr(bbox_tensor, 'numpy') else np.asarray(bbox_tensor)
+        if bbox_np.ndim == 2 and bbox_np.shape[0] > kp_idx:
+            bbox = bbox_np[kp_idx].tolist()
+
+    return {
+        "keypoints": keypoints_out.tolist(),
+        "bbox": bbox,
+    }
 
 
 # ======= Your action/metric functions (unchanged logic) ========
@@ -406,9 +377,6 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
     Also returns per-frame bbox and keypoints (first/left-most instance),
     with keypoints filtered by confidence >= conf.
     """
-    if not ULTRA_OK:
-        raise RuntimeError("ultralytics not installed")
-
     model = YOLO(model_path)
     try:
         model.to(device)
@@ -422,11 +390,7 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
     if do_warmup:
         import cv2
         dummy = np.zeros((256, 256, 3), dtype=np.uint8)
-        try:
-            _ = safe_ultra_predict(model, dummy, conf=conf, device=device, log_cb=log_cb)
-        except Exception as e:
-            if log_cb:
-                log_cb(f"Warm-up failed: {e}")
+        _ = safe_ultra_predict(model, dummy, conf=conf, device=device, log_cb=log_cb)
 
     import cv2
     cap = cv2.VideoCapture(video_path)
@@ -446,34 +410,10 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
         if not ret:
             break
 
-        try:
-            preds = safe_ultra_predict(model, frame, conf=conf, device=device, log_cb=log_cb)
-            res = preds[0] if len(preds) > 0 else None
-        except Exception as e:
-            if log_cb:
-                log_cb(f"Inference error on frame {idx}: {e}")
-            res = None
+        preds = safe_ultra_predict(model, frame, conf=conf, device=device, log_cb=log_cb)
+        res = preds[0] if len(preds) > 0 else None
 
-        detection = []
-        try:
-            if res is not None and getattr(res, 'keypoints', None) is not None and res.keypoints.conf is not None:
-                kp_tensor = res.keypoints.data.to('cpu').numpy()  # (N, K, 3) x,y,conf
-                bboxes = res.boxes.xyxy.to('cpu').numpy() if res.boxes is not None else [None] * len(kp_tensor)
-                # pick left-most subject
-                sorted_indices = sorted(range(len(kp_tensor)), key=lambda i: kp_tensor[i][:, 0].mean())
-                kp_idx = sorted_indices[0]
-                # --- filter keypoints by confidence ---
-                kp_arr = kp_tensor[kp_idx]
-                mask = kp_arr[:, 2] >= float(conf)
-                filtered = kp_arr[mask]
-                # If none pass, keep original with conf so downstream can decide
-                keypoints_out = (filtered if filtered.size else kp_arr).tolist()
-                detection = {
-                    "keypoints": keypoints_out,
-                    "bbox": bboxes[kp_idx].tolist() if bboxes[kp_idx] is not None else None,
-                }
-        except Exception:
-            detection = []
+        detection = extract_primary_detection(res, conf)
         results_per_frame[idx] = detection
         idx += 1
 
@@ -603,9 +543,8 @@ class MainWindow(QMainWindow):
 
         # State
         self.model_path: Optional[str] = None
-        self.device: str = 'cuda' if TORCH_OK and torch.cuda.is_available() else 'cpu'
-        self.conf: float = 0.50
-        self.mem_per_worker_gb: float = 2.0
+        self.device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.conf: float = 0.95
         self.max_workers: int = 1
 
         self.groups: Dict[str, GroupConfig] = {}
@@ -631,20 +570,15 @@ class MainWindow(QMainWindow):
         fm.addRow("YOLO Pose:", wroww)
 
         self.cb_device = QComboBox()
-        self.cb_device.addItems(['cpu'] + (['cuda'] if TORCH_OK and torch.cuda.is_available() else []))
+        self.cb_device.addItems(['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
         self.cb_device.setCurrentText(self.device)
         fm.addRow("Device:", self.cb_device)
 
         self.ds_conf = QDoubleSpinBox(); self.ds_conf.setRange(0.01, 1.0); self.ds_conf.setSingleStep(0.01); self.ds_conf.setValue(self.conf)
         fm.addRow("conf:", self.ds_conf)
 
-        self.ds_mem = QDoubleSpinBox(); self.ds_mem.setRange(0.1, 48.0); self.ds_mem.setSingleStep(0.1); self.ds_mem.setValue(self.mem_per_worker_gb)
-        fm.addRow("VRAM / worker (GB):", self.ds_mem)
-
-        btn_calc_workers = QPushButton("Auto workers by VRAM")
-        btn_calc_workers.clicked.connect(self.auto_workers)
         self.sb_workers = QSpinBox(); self.sb_workers.setRange(1, max(1, os.cpu_count() or 4)); self.sb_workers.setValue(1)
-        fm.addRow(btn_calc_workers, self.sb_workers)
+        fm.addRow("Worker threads:", self.sb_workers)
 
         left_l.addWidget(gb_model)
 
@@ -694,6 +628,12 @@ class MainWindow(QMainWindow):
 
         # 2) Table
         tab_table = QWidget(); tbl = QVBoxLayout(tab_table)
+        row_table = QHBoxLayout()
+        self.btn_export_table = QPushButton("Export table…")
+        self.btn_export_table.clicked.connect(self.export_table)
+        row_table.addStretch(1)
+        row_table.addWidget(self.btn_export_table)
+        tbl.addLayout(row_table)
         self.table_widget = QTableWidget()
         # Geometry-safe table header & policies
         hdr = self.table_widget.horizontalHeader()
@@ -711,27 +651,7 @@ class MainWindow(QMainWindow):
         tbl.addWidget(self.table_widget)
         self.tabs_central.addTab(tab_table, "Table")
 
-        # 3) Stats
-        tab_stats = QWidget(); tsl = QVBoxLayout(tab_stats)
-        row_stats = QHBoxLayout()
-        self.cb_pair_a = QComboBox(); self.cb_pair_b = QComboBox()
-        row_stats.addWidget(QLabel("Compare:"))
-        row_stats.addWidget(self.cb_pair_a)
-        row_stats.addWidget(QLabel("vs"))
-        row_stats.addWidget(self.cb_pair_b)
-        self.btn_draw_stats = QPushButton("Draw plots")
-        self.btn_draw_stats.clicked.connect(self.draw_stats)
-        row_stats.addWidget(self.btn_draw_stats)
-        row_stats.addStretch(1)
-        tsl.addLayout(row_stats)
-        self.lbl_stats_img = QLabel("Plots will appear here")
-        self.lbl_stats_img.setAlignment(Qt.AlignCenter)
-        self.lbl_stats_img.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.lbl_stats_img.setMinimumSize(0, 0)
-        tsl.addWidget(self.lbl_stats_img, 1)
-        self.tabs_central.addTab(tab_stats, "Stats")
-
-        # 4) Classifier + SHAP
+        # 3) Classifier + SHAP
         tab_cls = QWidget(); cl = QVBoxLayout(tab_cls)
         top_cls = QHBoxLayout()
         self.cb_cls_a = QComboBox(); self.cb_cls_b = QComboBox()
@@ -754,11 +674,6 @@ class MainWindow(QMainWindow):
         cent_l.addWidget(self.tabs_central)
         self.setCentralWidget(central)
 
-        # Menu
-        act_export_table = QAction("Export table_data.csv", self)
-        act_export_table.triggered.connect(self.export_table)
-        self.menuBar().addAction(act_export_table)
-
         # Worker handles
         self._worker_threads: List[Thread] = []
         self._worker_lock = Lock()
@@ -780,29 +695,16 @@ class MainWindow(QMainWindow):
             self.le_model.setText(path)
             self.log(f"Model selected: {os.path.basename(path)}")
             # Warm-up once at selection time to compile kernels ahead
-            if ULTRA_OK:
-                try:
-                    from ultralytics import YOLO as _YO
-                    dev = self.cb_device.currentText()
-                    mdl = _YO(self.model_path)
-                    try:
-                        mdl.to(dev)
-                    except Exception as e:
-                        self.log(f"Model.to({dev}) failed: {e}. Using CPU.")
-                        mdl.to('cpu')
-                    dummy = np.zeros((256,256,3), dtype=np.uint8)
-                    _ = mdl(dummy, conf=0.50, verbose=False)
-                    self.log("Warm-up inference OK.")
-                except Exception as e:
-                    self.log(f"Warm-up failed: {e}")
-
-    def auto_workers(self):
-        self.mem_per_worker_gb = float(self.ds_mem.value())
-        n = estimate_workers_by_vram(self.mem_per_worker_gb)
-        self.sb_workers.setValue(n)
-        info = "GPU not found" if not (TORCH_OK and torch.cuda.is_available()) else \
-               f"Total VRAM: {human_bytes(torch.cuda.get_device_properties(0).total_memory)}"
-        self.log(f"Auto workers → {n}. {info}")
+            dev = self.cb_device.currentText()
+            mdl = YOLO(self.model_path)
+            try:
+                mdl.to(dev)
+            except Exception as e:
+                self.log(f"Model.to({dev}) failed: {e}. Using CPU.")
+                mdl.to('cpu')
+            dummy = np.zeros((256,256,3), dtype=np.uint8)
+            _ = mdl(dummy, conf=0.50, verbose=False)
+            self.log("Warm-up inference OK.")
 
     # ====== Groups ======
     def add_group(self):
@@ -832,7 +734,7 @@ class MainWindow(QMainWindow):
 
     def update_pairs(self):
         groups = list(self.groups.keys())
-        for cb in (self.cb_pair_a, self.cb_pair_b, self.cb_cls_a, self.cb_cls_b):
+        for cb in (self.cb_cls_a, self.cb_cls_b):
             old = cb.currentText()
             cb.clear(); cb.addItems(groups)
             if old in groups:
@@ -1031,9 +933,12 @@ class MainWindow(QMainWindow):
         self.table_data = df
         self.populate_table_widget()
         # Export
-        out_csv = os.path.join(self.run_dir, 'table_data.csv')
-        df.to_csv(out_csv, index=False)
-        self.log(f"table_data.csv saved: {out_csv}")
+        out_xlsx = os.path.join(self.run_dir, 'table_data.xlsx')
+        try:
+            df.to_excel(out_xlsx, index=False)
+            self.log(f"table_data.xlsx saved: {out_xlsx}")
+        except Exception as exc:
+            self.log(f"Failed to save table_data.xlsx: {exc}")
         # Update comboboxes
         self.update_pairs()
 
@@ -1054,76 +959,19 @@ class MainWindow(QMainWindow):
         if self.table_data is None:
             QMessageBox.information(self, "Export", "Generate the table first")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save table_data.csv", "table_data.csv", "*.csv")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save table_data.xlsx",
+            "table_data.xlsx",
+            "Excel files (*.xlsx)"
+        )
         if not path:
             return
-        self.table_data.to_csv(path, index=False)
-        self.log(f"Saved: {path}")
-
-    # ====== Stats ======
-    def draw_stats(self):
-        if not MPL_OK:
-            QMessageBox.warning(self, "Matplotlib", "Matplotlib/Seaborn/Scipy/Statsmodels unavailable")
-            return
-        if self.table_data is None or self.table_data.empty:
-            QMessageBox.warning(self, "Table", "No data for plots")
-            return
-        g1 = self.cb_pair_a.currentText(); g2 = self.cb_pair_b.currentText()
-        if not g1 or not g2 or g1 == g2:
-            QMessageBox.warning(self, "Compare", "Pick two different groups")
-            return
-        df = self.table_data.copy()
-        group_pairs = [(g1, g2)]
-        numeric_cols = df.columns[1:]
-
-        ncols = min(3, len(numeric_cols))
-        nrows = math.ceil(len(numeric_cols) / ncols)
-        fig, axes = plt.subplots(nrows, ncols, figsize=(8*ncols, 6*nrows))
-        if nrows == 1 and ncols == 1:
-            axes = np.array([[axes]])
-        elif nrows == 1:
-            axes = np.array([axes])
-        axes = axes.flatten()
-
-        def get_star(p):
-            return '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else 'ns'))
-
-        for i, col in enumerate(numeric_cols):
-            ax = axes[i]
-            sns.boxplot(x='id', y=col, hue='id', data=df, palette='Set2', width=0.6,
-                        linewidth=2, fliersize=0, dodge=False, legend=False, ax=ax)
-            sns.stripplot(x='id', y=col, data=df, color='black', alpha=0.7, jitter=True, size=6, ax=ax)
-            p_vals = []
-            for a, b in group_pairs:
-                data1 = df[df['id'] == a][col]
-                data2 = df[df['id'] == b][col]
-                try:
-                    _, p = mannwhitneyu(data1, data2, alternative='two-sided')
-                except Exception:
-                    p = 1.0
-                p_vals.append(p)
-            _, p_corr, _, _ = multipletests(p_vals, method='fdr_bh')
-            y_max = df[col].max()
-            y_min = df[col].min()
-            h = (y_max - y_min) * 0.1 if np.isfinite(y_max) and np.isfinite(y_min) else 1.0
-            x1 = list(df['id'].unique()).index(g1)
-            x2 = list(df['id'].unique()).index(g2)
-            y = (y_max if np.isfinite(y_max) else 1.0) + h
-            ax.plot([x1, x1, x2, x2], [y, y + h*0.2, y + h*0.2, y], lw=1.8, c='k')
-            ax.text((x1 + x2) * 0.5, y + h * 0.25, get_star(p_corr[0]), ha='center', va='bottom', color='k', fontsize=12)
-            ax.set_title(col, fontsize=14, weight='bold')
-            ax.set_xlabel(''); ax.set_ylabel('')
-            ax.grid(axis='y', linestyle='--', alpha=0.7)
-            sns.despine(ax=ax)
-
-        for j in range(len(numeric_cols), len(axes)):
-            fig.delaxes(axes[j])
-        fig.tight_layout()
-        out = os.path.join(self.run_dir, 'combined_stats.png')
-        fig.savefig(out, dpi=300)
-        plt.close(fig)
-        self.set_image_to_label(out, self.lbl_stats_img)
-        self.log(f"Plots saved: {out}")
+        try:
+            self.table_data.to_excel(path, index=False)
+            self.log(f"Saved: {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export", f"Failed to save Excel file:\n{exc}")
 
     def set_image_to_label(self, path: str, label: QLabel):
         if not os.path.isfile(path):
@@ -1136,11 +984,29 @@ class MainWindow(QMainWindow):
         label.setPixmap(pix.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         label.setToolTip(path)
 
+    def _render_shap_summary(self, model, data: pd.DataFrame, title: str):
+        """Render SHAP summary plot when dependencies are available."""
+        if data is None or data.empty:
+            self.te_cls.append("\n[SHAP skipped: insufficient samples]")
+            return
+
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(data)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
+
+        fig = plt.figure(figsize=(8, 6))
+        shap.summary_plot(shap_values, data, feature_names=data.columns, plot_type='dot', show=False)
+        plt.title(title)
+        out = os.path.join(self.run_dir, 'shap_summary.png')
+        plt.tight_layout()
+        plt.savefig(out, dpi=300)
+        plt.close(fig)
+        self.set_image_to_label(out, self.lbl_shap)
+        self.log(f"SHAP saved: {out}")
+
     # ====== Classifier + SHAP ======
     def run_classifier(self):
-        if not SK_OK:
-            QMessageBox.warning(self, "Sklearn", "scikit-learn unavailable")
-            return
         if self.table_data is None or self.table_data.empty:
             QMessageBox.warning(self, "Table", "No data for classifier")
             return
@@ -1167,28 +1033,11 @@ class MainWindow(QMainWindow):
                 n_estimators=500, min_samples_leaf=1, min_samples_split=2,
                 max_features='sqrt', bootstrap=True, random_state=5
             )
-            try:
-                rf.fit(X, y)
-            except Exception as e:
-                self.te_cls.append(f"\n[RF fit error: {e}]")
-                return
+            rf.fit(X, y)
             self.te_cls.append("\nModel trained on full data.")
             # SHAP (optional)
-            if SHAP_OK and len(X) >= 2:
-                try:
-                    explainer = shap.TreeExplainer(rf)
-                    sv = explainer.shap_values(X)
-                    if isinstance(sv, list):  # multiclass list
-                        sv = sv[0]
-                    fig = plt.figure(figsize=(8, 6))
-                    shap.summary_plot(sv, X, feature_names=X.columns, plot_type='dot', show=False)
-                    plt.title(f"{g2} vs {g1} (no test split)")
-                    out = os.path.join(self.run_dir, 'shap_summary.png')
-                    plt.tight_layout(); plt.savefig(out, dpi=300); plt.close(fig)
-                    self.set_image_to_label(out, self.lbl_shap)
-                    self.log(f"SHAP saved: {out}")
-                except Exception as e:
-                    self.te_cls.append(f"\n[SHAP error: {e}]")
+            if len(X) >= 2:
+                self._render_shap_summary(rf, X, f"{g2} vs {g1} (no test split)")
             return
 
         # Normal stratified split
@@ -1206,24 +1055,7 @@ class MainWindow(QMainWindow):
         self.te_cls.clear()
         self.te_cls.append(f"Accuracy: {acc:.4f}\n\n{rep}")
 
-        # SHAP
-        if not SHAP_OK:
-            self.te_cls.append("\n[SHAP unavailable]")
-            return
-        try:
-            explainer = shap.TreeExplainer(rf)
-            sv = explainer.shap_values(X_test)
-            if isinstance(sv, list):
-                sv = sv[0]
-            fig = plt.figure(figsize=(8, 6))
-            shap.summary_plot(sv, X_test, feature_names=X_test.columns, plot_type='dot', show=False)
-            plt.title(f"{g2} vs {g1}")
-            out = os.path.join(self.run_dir, 'shap_summary.png')
-            plt.tight_layout(); plt.savefig(out, dpi=300); plt.close(fig)
-            self.set_image_to_label(out, self.lbl_shap)
-            self.log(f"SHAP saved: {out}")
-        except Exception as e:
-            self.te_cls.append(f"\n[SHAP error: {e}]")
+        self._render_shap_summary(rf, X_test, f"{g2} vs {g1}")
 
 def main():
     app = QApplication(sys.argv)
