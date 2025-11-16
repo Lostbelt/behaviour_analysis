@@ -3,6 +3,7 @@ import sys
 import glob
 import json
 import time
+import hashlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 from threading import Thread, Lock
@@ -27,15 +28,17 @@ from ultralytics import YOLO
 import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import RepeatedStratifiedKFold, ParameterGrid, cross_val_score
+from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier
 
 import shap
+from joblib import Parallel, delayed
 
 
 # ======== Helpers & constants ========
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".MP4", ".MOV", ".AVI"}
+DEFAULT_DETECTION_CONF = 0.10
 
 
 def list_videos_in_folder(folder: str) -> List[str]:
@@ -52,9 +55,11 @@ def list_videos_in_folder(folder: str) -> List[str]:
     return out
 
 
-def safe_ultra_predict(model, frame, conf, device, on_cuda_error_fallback_cpu=True, log_cb=None):
+def safe_ultra_predict(model, frame, conf: float = DEFAULT_DETECTION_CONF, device='cpu',
+                       on_cuda_error_fallback_cpu=True, log_cb=None):
     """
     Run single-frame inference with graceful CUDA->CPU fallback when torchvision::nms is missing.
+    `conf` here refers to the YOLO detection threshold and defaults to DEFAULT_DETECTION_CONF.
     """
     try:
         return model(frame, verbose=False, conf=conf)
@@ -108,7 +113,7 @@ def render_overlay(video_path: str, predictions: List[dict], out_path: str, fps:
     writer.release()
 
 
-def extract_primary_detection(result, conf: float):
+def extract_primary_detection(result, conf: Optional[float] = None):
     """Return the left-most detection dict or [] without relying on try/except."""
     if result is None:
         return []
@@ -133,9 +138,12 @@ def extract_primary_detection(result, conf: float):
     if kp_arr.ndim != 2 or kp_arr.shape[0] == 0:
         return []
 
-    mask = kp_arr[:, 2] >= float(conf)
-    filtered = kp_arr[mask]
-    keypoints_out = filtered if filtered.size else kp_arr
+    if conf is not None:
+        mask = kp_arr[:, 2] >= float(conf)
+        filtered = kp_arr[mask]
+        keypoints_out = filtered if filtered.size else kp_arr
+    else:
+        keypoints_out = kp_arr
 
     bbox = None
     if boxes is not None and getattr(boxes, 'xyxy', None) is not None:
@@ -188,6 +196,8 @@ def raw_data_to_actions(
     conf_thr=0.5,
     frame_step=3,
     fps=30,
+    rear_ratio_threshold: float = 2.0,
+    research_disp_threshold: float = 0.18,
 ):
     frame_width, frame_height = frame_dims
     if mean_dist_body is None:
@@ -268,10 +278,10 @@ def raw_data_to_actions(
                         vf = np.mean(cur_kp[fi, :2][fc] - prev_keypoints[fi, :2][fc], axis=0)
                         front_disp = float(np.linalg.norm(vf) / mean_dist_body)
 
-                if bbox_ratio is not None and bbox_ratio < 2:
+                if bbox_ratio is not None and bbox_ratio < rear_ratio_threshold:
                     action = "Rear"
                 else:
-                    action = "Research" if avg_disp > 0.18 else "Still"
+                    action = "Research" if avg_disp > research_disp_threshold else "Still"
 
                 prev_keypoints = cur_kp.copy()
 
@@ -371,11 +381,12 @@ def compute_action_stats(actions, nose_distances, fps=30):
 # ======== Pose inference on a single video (single-frame) ========
 
 def process_video_with_model(model_path: str, video_path: str, conf: float = 0.50,
-                             device: str = 'cuda', log_cb=None, do_warmup=True) -> Dict:
+                             device: str = 'cuda', log_cb=None, do_warmup=True,
+                             detect_conf: float = DEFAULT_DETECTION_CONF) -> Dict:
     """
     Process one video frame-by-frame (no batching). Returns dict like V*_cuted_video_keypoints.json.
     Also returns per-frame bbox and keypoints (first/left-most instance),
-    with keypoints filtered by confidence >= conf.
+    while detection itself always runs with detect_conf (defaults to DEFAULT_DETECTION_CONF).
     """
     model = YOLO(model_path)
     try:
@@ -390,7 +401,7 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
     if do_warmup:
         import cv2
         dummy = np.zeros((256, 256, 3), dtype=np.uint8)
-        _ = safe_ultra_predict(model, dummy, conf=conf, device=device, log_cb=log_cb)
+        _ = safe_ultra_predict(model, dummy, conf=detect_conf, device=device, log_cb=log_cb)
 
     import cv2
     cap = cv2.VideoCapture(video_path)
@@ -410,10 +421,10 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
         if not ret:
             break
 
-        preds = safe_ultra_predict(model, frame, conf=conf, device=device, log_cb=log_cb)
+        preds = safe_ultra_predict(model, frame, conf=detect_conf, device=device, log_cb=log_cb)
         res = preds[0] if len(preds) > 0 else None
 
-        detection = extract_primary_detection(res, conf)
+        detection = extract_primary_detection(res)
         results_per_frame[idx] = detection
         idx += 1
 
@@ -424,6 +435,7 @@ def process_video_with_model(model_path: str, video_path: str, conf: float = 0.5
         "fps": fps,
         "frame_size": (width, height),
         "rat": results_per_frame,
+        "analysis_conf": conf,
     }
     return video_data
 
@@ -540,12 +552,17 @@ class MainWindow(QMainWindow):
         # Work dir
         self.run_dir = os.path.join(os.getcwd(), 'runs', 'pose_app', time.strftime('%Y%m%d_%H%M%S'))
         os.makedirs(self.run_dir, exist_ok=True)
+        self.cache_dir = os.path.join(self.run_dir, 'cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         # State
         self.model_path: Optional[str] = None
         self.device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.conf: float = 0.95
         self.max_workers: int = 1
+        self.rear_ratio_thr: float = 2.0
+        self.research_disp_thr: float = 0.18
+        self.trim_duration: float = 600.0  # seconds
 
         self.groups: Dict[str, GroupConfig] = {}
         self.predictions: Dict[str, dict] = {}  # video_path -> video_data
@@ -619,21 +636,34 @@ class MainWindow(QMainWindow):
         central = QWidget()
         cent_l = QVBoxLayout(central)
         central.setMinimumSize(0, 0)
-        self.tabs_central = QTabWidget()
+        self.tabs_main = QTabWidget()
 
-        # 1) Video (tabs inside)
+        # 1) Videos tab hosts video sub-tabs directly
         self.video_tabs = QTabWidget()
-        tab_video_container = QWidget(); tvl = QVBoxLayout(tab_video_container); tvl.addWidget(self.video_tabs)
-        self.tabs_central.addTab(tab_video_container, "Videos")
+        self.tabs_main.addTab(self.video_tabs, "Videos")
 
         # 2) Table
         tab_table = QWidget(); tbl = QVBoxLayout(tab_table)
         row_table = QHBoxLayout()
-        self.btn_export_table = QPushButton("Export table…")
+        self.btn_load_json = QPushButton("Load JSON")
+        self.btn_load_json.clicked.connect(self.load_predictions_json)
+        self.btn_rebuild_table = QPushButton("Rebuild table")
+        self.btn_rebuild_table.clicked.connect(self.build_table)
+        self.btn_export_table = QPushButton("Export table")
         self.btn_export_table.clicked.connect(self.export_table)
+        row_table.addWidget(self.btn_load_json)
+        row_table.addWidget(self.btn_rebuild_table)
         row_table.addStretch(1)
         row_table.addWidget(self.btn_export_table)
         tbl.addLayout(row_table)
+        thresh_form = QFormLayout()
+        self.ds_rear_ratio = QDoubleSpinBox(); self.ds_rear_ratio.setRange(0.5, 10.0); self.ds_rear_ratio.setSingleStep(0.1); self.ds_rear_ratio.setValue(self.rear_ratio_thr)
+        thresh_form.addRow("Rear ratio threshold:", self.ds_rear_ratio)
+        self.ds_research_disp = QDoubleSpinBox(); self.ds_research_disp.setRange(0.0, 2.0); self.ds_research_disp.setSingleStep(0.01); self.ds_research_disp.setDecimals(3); self.ds_research_disp.setValue(self.research_disp_thr)
+        thresh_form.addRow("Research displacement threshold:", self.ds_research_disp)
+        self.ds_trim_minutes = QDoubleSpinBox(); self.ds_trim_minutes.setRange(0.5, 120.0); self.ds_trim_minutes.setSingleStep(0.5); self.ds_trim_minutes.setValue(self.trim_duration / 60.0)
+        thresh_form.addRow("Trim duration (minutes):", self.ds_trim_minutes)
+        tbl.addLayout(thresh_form)
         self.table_widget = QTableWidget()
         # Geometry-safe table header & policies
         hdr = self.table_widget.horizontalHeader()
@@ -649,7 +679,7 @@ class MainWindow(QMainWindow):
         self.table_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.table_widget.setMinimumSize(0, 0)
         tbl.addWidget(self.table_widget)
-        self.tabs_central.addTab(tab_table, "Table")
+        self.tabs_main.addTab(tab_table, "Table")
 
         # 3) Classifier + SHAP
         tab_cls = QWidget(); cl = QVBoxLayout(tab_cls)
@@ -664,14 +694,24 @@ class MainWindow(QMainWindow):
         cl.addLayout(top_cls)
         self.te_cls = QTextEdit(); self.te_cls.setReadOnly(True)
         cl.addWidget(self.te_cls, 1)
+        self.tbl_bootstrap_stats = QTableWidget()
+        self.tbl_bootstrap_stats.setColumnCount(0)
+        self.tbl_bootstrap_stats.setRowCount(0)
+        self.tbl_bootstrap_stats.setMinimumHeight(120)
+        cl.addWidget(self.tbl_bootstrap_stats)
+        self.tbl_shap_features = QTableWidget()
+        self.tbl_shap_features.setColumnCount(0)
+        self.tbl_shap_features.setRowCount(0)
+        self.tbl_shap_features.setMinimumHeight(150)
+        cl.addWidget(self.tbl_shap_features, 1)
         self.lbl_shap = QLabel("SHAP summary will appear here")
         self.lbl_shap.setAlignment(Qt.AlignCenter)
         self.lbl_shap.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.lbl_shap.setMinimumSize(0, 0)
         cl.addWidget(self.lbl_shap, 1)
-        self.tabs_central.addTab(tab_cls, "Classifier & SHAP")
+        self.tabs_main.addTab(tab_cls, "Classifier & SHAP")
 
-        cent_l.addWidget(self.tabs_central)
+        cent_l.addWidget(self.tabs_main)
         self.setCentralWidget(central)
 
         # Worker handles
@@ -789,6 +829,18 @@ class MainWindow(QMainWindow):
         self.log("Starting inference...")
         self._start_data_parallel_infer(all_videos)
 
+    def _cache_prediction_path(self, video_path: str) -> str:
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        digest = hashlib.sha1(video_path.encode('utf-8')).hexdigest()[:10]
+        return os.path.join(self.cache_dir, f"{base}_{digest}.json")
+
+    def _save_prediction_json(self, video_path: str, data: dict) -> str:
+        cache_path = self._cache_prediction_path(video_path)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        return cache_path
+
     def _start_data_parallel_infer(self, videos: List[str]):
         # Split video list into N shards
         n = max(1, self.max_workers)
@@ -808,6 +860,11 @@ class MainWindow(QMainWindow):
                     vd = process_video_with_model(self.model_path, v, conf=self.conf, device=self.device,
                                                   log_cb=lambda m: self._worker_queue.put(("log", f"[W{shard_idx+1}] {m}")))
                     shard_results[v] = vd
+                    try:
+                        cache_path = self._save_prediction_json(v, vd)
+                        self._worker_queue.put(("log", f"[W{shard_idx+1}] Cached JSON: {cache_path}"))
+                    except Exception as cache_exc:
+                        self._worker_queue.put(("log", f"[W{shard_idx+1}] Failed to cache {os.path.basename(v)}: {cache_exc}"))
                     # write annotated mp4
                     out_mp4 = os.path.join(self.run_dir, f"annot_{os.path.basename(v)}")
                     render_overlay(v, vd['rat'], out_mp4, vd['fps'], vd['frame_size'])
@@ -850,23 +907,61 @@ class MainWindow(QMainWindow):
             self._inference_running = False
             self._collector_timer.stop()
             self.pb.setVisible(False)
-            # Save group-wise raw predictions
-            for gname, g in self.groups.items():
-                gjson = {}
-                for v in g.videos:
-                    if v in self.predictions:
-                        gjson[v] = self.predictions[v]
-                if gjson:
-                    out = os.path.join(self.run_dir, f"predictions_{gname}.json")
+            # Save a single JSON with all predictions
+            if self.predictions:
+                out = os.path.join(self.run_dir, "predictions_all.json")
+                try:
                     with open(out, 'w', encoding='utf-8') as f:
-                        json.dump(gjson, f, ensure_ascii=False)
+                        json.dump(self.predictions, f, ensure_ascii=False)
                     self.log(f"Saved: {out}")
+                except Exception as exc:
+                    self.log(f"Failed to save predictions_all.json: {exc}")
             # Build table
             self.build_table()
             self.log("Inference finished.")
 
     # ====== Postprocess & table ======
+    def load_predictions_json(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load cached predictions", "", "JSON files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load JSON", f"Failed to read file:\n{exc}")
+            return
+
+        loaded = 0
+        if isinstance(data, dict):
+            if {"video_path", "rat", "frame_size"}.issubset(data.keys()):
+                vp = data.get("video_path")
+                if vp:
+                    self.predictions[vp] = data
+                    loaded = 1
+            else:
+                for vp, vd in data.items():
+                    if isinstance(vd, dict):
+                        self.predictions[vp] = vd
+                        loaded += 1
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("video_path"):
+                    self.predictions[item["video_path"]] = item
+                    loaded += 1
+
+        if not loaded:
+            QMessageBox.warning(self, "Load JSON", "File does not contain recognizable prediction data.")
+            return
+
+        self.log(f"Loaded {loaded} cached video(s) from {path}")
+        self.build_table()
+
     def build_table(self):
+        self.conf = float(self.ds_conf.value())
+        self.rear_ratio_thr = float(self.ds_rear_ratio.value())
+        self.research_disp_thr = float(self.ds_research_disp.value())
+        self.trim_duration = float(self.ds_trim_minutes.value()) * 60.0
         rows = []
         for gname, g in self.groups.items():
             for v in g.videos:
@@ -874,10 +969,20 @@ class MainWindow(QMainWindow):
                     continue
                 vd = self.predictions[v]
                 rat_actions, metrics_list, nose_distances = raw_data_to_actions(
-                    vd['rat'], frame_dims=vd['frame_size'], fps=int(round(vd.get('fps', 30))), conf_thr=self.conf
+                    vd['rat'],
+                    frame_dims=vd['frame_size'],
+                    fps=int(round(vd.get('fps', 30))),
+                    conf_thr=self.conf,
+                    rear_ratio_threshold=self.rear_ratio_thr,
+                    research_disp_threshold=self.research_disp_thr,
                 )
                 fps = int(round(vd.get('fps', 30)))
-                trimmed, nose_trim = trim_actions_to_duration(rat_actions, nose_distances, fps)
+                trimmed, nose_trim = trim_actions_to_duration(
+                    rat_actions,
+                    nose_distances,
+                    fps,
+                    duration_seconds=self.trim_duration,
+                )
                 stats = compute_action_stats(trimmed, nose_trim, fps=fps)
                 rows.append({
                     'id': gname,
@@ -973,6 +1078,23 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Export", f"Failed to save Excel file:\n{exc}")
 
+    def _set_table_widget_from_df(self, widget: QTableWidget, df: Optional[pd.DataFrame]):
+        widget.clear()
+        if df is None or df.empty:
+            widget.setRowCount(0)
+            widget.setColumnCount(0)
+            return
+        widget.setRowCount(len(df))
+        widget.setColumnCount(len(df.columns))
+        widget.setHorizontalHeaderLabels(df.columns.tolist())
+        for r in range(len(df)):
+            for c in range(len(df.columns)):
+                widget.setItem(r, c, QTableWidgetItem(str(df.iat[r, c])))
+
+    def populate_bootstrap_results(self, metrics_df: Optional[pd.DataFrame], shap_df: Optional[pd.DataFrame]):
+        self._set_table_widget_from_df(self.tbl_bootstrap_stats, metrics_df)
+        self._set_table_widget_from_df(self.tbl_shap_features, shap_df)
+
     def set_image_to_label(self, path: str, label: QLabel):
         if not os.path.isfile(path):
             return
@@ -984,23 +1106,29 @@ class MainWindow(QMainWindow):
         label.setPixmap(pix.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         label.setToolTip(path)
 
-    def _render_shap_summary(self, model, data: pd.DataFrame, title: str):
-        """Render SHAP summary plot when dependencies are available."""
-        if data is None or data.empty:
-            self.te_cls.append("\n[SHAP skipped: insufficient samples]")
+    def _render_shap_summary(self, shap_values: np.ndarray, features: pd.DataFrame,
+                              title: str, x_limits: Optional[Tuple[float, float]] = None):
+        """Render SHAP summary plot when matrix + feature frame are provided."""
+        if shap_values is None or shap_values.size == 0 or features is None or features.empty:
+            self.lbl_shap.setText("No SHAP data")
             return
 
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(data)
-        if isinstance(shap_values, list):
-            shap_values = shap_values[0]
-
-        fig = plt.figure(figsize=(8, 6))
-        shap.summary_plot(shap_values, data, feature_names=data.columns, plot_type='dot', show=False)
-        plt.title(title)
-        out = os.path.join(self.run_dir, 'shap_summary.png')
+        fig = plt.figure(figsize=(7, 6))
+        shap.summary_plot(
+            shap_values,
+            features,
+            feature_names=list(features.columns),
+            plot_type='dot',
+            show=False
+        )
+        ax = plt.gca()
+        ax.axvline(0.0, color='grey', linewidth=1)
+        if x_limits:
+            ax.set_xlim(*x_limits)
+        plt.title(title, fontweight="bold")
+        out = os.path.join(self.run_dir, f'shap_summary_{title.replace(" ", "_")}.png')
         plt.tight_layout()
-        plt.savefig(out, dpi=300)
+        plt.savefig(out, dpi=350, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         self.set_image_to_label(out, self.lbl_shap)
         self.log(f"SHAP saved: {out}")
@@ -1010,52 +1138,232 @@ class MainWindow(QMainWindow):
         if self.table_data is None or self.table_data.empty:
             QMessageBox.warning(self, "Table", "No data for classifier")
             return
-        g1 = self.cb_cls_a.currentText(); g2 = self.cb_cls_b.currentText()
-        if not g1 or not g2 or g1 == g2:
+        g_pos = self.cb_cls_a.currentText(); g_neg = self.cb_cls_b.currentText()
+        if not g_pos or not g_neg or g_pos == g_neg:
             QMessageBox.warning(self, "Compare", "Pick two different groups")
             return
-        df = self.table_data
-        pair_df = df[df['id'].isin([g1, g2])].copy()
-        labels = pair_df['id']
-        features = pair_df.drop(columns=['id'])
-        scaler = StandardScaler(); X = pd.DataFrame(scaler.fit_transform(features), columns=features.columns)
-        encoder = LabelEncoder(); y = encoder.fit_transform(labels)
-
-        # Robustness for tiny datasets
-        counts = pd.Series(y).value_counts()
-        if counts.min() < 2 or len(pair_df) < 4:
-            # Train on all, no split
-            self.te_cls.clear()
-            self.te_cls.append("[Warning] Too few samples per class for stratified split.\n"
-                               f"Class distribution: {dict(zip(encoder.classes_, counts.reindex(range(len(encoder.classes_))).fillna(0).astype(int).tolist()))}\n"
-                               "Training RandomForest on all available data; accuracy on held-out set is not computed.")
-            rf = RandomForestClassifier(
-                n_estimators=500, min_samples_leaf=1, min_samples_split=2,
-                max_features='sqrt', bootstrap=True, random_state=5
-            )
-            rf.fit(X, y)
-            self.te_cls.append("\nModel trained on full data.")
-            # SHAP (optional)
-            if len(X) >= 2:
-                self._render_shap_summary(rf, X, f"{g2} vs {g1} (no test split)")
+        df = self.table_data.copy()
+        pair_df = df[df['id'].isin([g_pos, g_neg])].copy()
+        if pair_df.empty:
+            QMessageBox.warning(self, "Table", "Selected groups are missing in the table")
             return
 
-        # Normal stratified split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, stratify=y, random_state=5
-        )
-        rf = RandomForestClassifier(
-            n_estimators=500, min_samples_leaf=4, min_samples_split=2,
-            max_features='sqrt', bootstrap=True, random_state=5
-        )
-        rf.fit(X_train, y_train)
-        preds = rf.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-        rep = classification_report(y_test, preds, target_names=encoder.classes_, zero_division=0)
-        self.te_cls.clear()
-        self.te_cls.append(f"Accuracy: {acc:.4f}\n\n{rep}")
+        labels = pair_df['id']
+        features = pair_df.drop(columns=['id'])
+        if features.empty:
+            QMessageBox.warning(self, "Table", "No feature columns found")
+            return
 
-        self._render_shap_summary(rf, X_test, f"{g2} vs {g1}")
+        scaler = StandardScaler()
+        X = pd.DataFrame(scaler.fit_transform(features), columns=features.columns)
+        encoder = LabelEncoder()
+        y = encoder.fit_transform(labels)
+        classes = list(encoder.classes_)
+        if len(classes) != 2 or g_pos not in classes or g_neg not in classes:
+            QMessageBox.warning(self, "Compare", "Classifier currently supports exactly two groups")
+            return
+
+        n_samples = len(X)
+        if n_samples < 6:
+            QMessageBox.warning(self, "Classifier", "Need at least 6 samples for bootstrap routine")
+            return
+
+        # Hyperparameter + bootstrap settings (aligned with user-provided snippet)
+        RANDOM_STATE = 60
+        cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=5, random_state=RANDOM_STATE)
+        param_grid = dict(
+            n_estimators=[800],
+            max_depth=[12],
+            min_samples_split=[2, 4],
+            min_samples_leaf=[1, 2, 4],
+        )
+        base_rf_kw = dict(
+            max_features='sqrt',
+            bootstrap=True,
+            n_jobs=-1,
+        )
+        bootstrap_reps = 800
+        min_per_class_oob = 2
+        min_oob_size = 4
+        max_redraws = 1000
+        n_jobs = -1
+
+        X_np = X.values
+        classes_idx = [np.where(y == c)[0] for c in np.unique(y)]
+        if any(len(idx) == 0 for idx in classes_idx):
+            QMessageBox.warning(self, "Classifier", "One of the classes is empty after encoding.")
+            return
+
+        # Stage 0: hyperparameter tuning via CV AUC
+        best_score, best_params = -np.inf, None
+        self.te_cls.clear()
+        self.te_cls.append("Running CV-based hyperparameter search...\n")
+        for params in ParameterGrid(param_grid):
+            rf = RandomForestClassifier(random_state=RANDOM_STATE, **base_rf_kw, **params)
+            try:
+                scores = cross_val_score(rf, X_np, y, cv=cv, scoring='roc_auc', n_jobs=base_rf_kw.get('n_jobs', None))
+            except Exception as exc:
+                self.log(f"Grid search failed for {params}: {exc}")
+                continue
+            mean_score = float(np.mean(scores)) if len(scores) else float('-inf')
+            if mean_score > best_score:
+                best_score, best_params = mean_score, params
+        if best_params is None:
+            QMessageBox.warning(self, "Classifier", "Hyperparameter search failed.")
+            return
+        self.te_cls.append(f"[GridSearch] {g_pos} vs {g_neg}: best CV AUC = {best_score:.3f} with {best_params}\n")
+
+        rf_fixed = dict(**base_rf_kw, **best_params)
+        pos_index = classes.index(g_pos)
+
+        def bootstrap_iteration(seed_offset: int):
+            rng = np.random.default_rng(RANDOM_STATE + seed_offset)
+            redraws = 0
+            while redraws < max_redraws:
+                boot_indices = []
+                for cls_idx in classes_idx:
+                    boot_indices.append(rng.choice(cls_idx, size=len(cls_idx), replace=True))
+                idx_boot = np.concatenate(boot_indices)
+                oob_mask = np.ones(n_samples, dtype=bool)
+                oob_mask[idx_boot] = False
+                idx_oob = np.where(oob_mask)[0]
+                if idx_oob.size < min_oob_size:
+                    redraws += 1
+                    continue
+                ok = True
+                for cls_val in np.unique(y):
+                    if np.sum(y[idx_oob] == cls_val) < min_per_class_oob:
+                        ok = False
+                        break
+                if ok:
+                    break
+                redraws += 1
+            else:
+                return None
+
+            clf = RandomForestClassifier(**rf_fixed, random_state=RANDOM_STATE + seed_offset)
+            clf.fit(X_np[idx_boot], y[idx_boot])
+
+            try:
+                preds = clf.predict_proba(X_np[idx_oob])[:, 1]
+                metric = roc_auc_score(y[idx_oob], preds)
+            except Exception:
+                preds = clf.predict(X_np[idx_oob])
+                metric = accuracy_score(y[idx_oob], preds)
+
+            explainer = shap.TreeExplainer(clf)
+            shap_vals = explainer.shap_values(X_np[idx_oob])
+            if isinstance(shap_vals, list):
+                shap_pos = shap_vals[pos_index]
+            else:
+                shap_pos = shap_vals
+            if shap_pos.ndim == 3:
+                shap_pos = shap_pos[:, :, pos_index]
+
+            return {
+                "metric": metric,
+                "idx_oob": idx_oob,
+                "shap_vals": shap_pos,
+                "redraws": redraws + 1,
+            }
+
+        self.te_cls.append(f"Starting bootstrap ({bootstrap_reps} reps)... this may take a while.\n")
+        try:
+            results = Parallel(n_jobs=n_jobs, backend='loky')(
+                delayed(bootstrap_iteration)(i) for i in range(bootstrap_reps)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Bootstrap", f"Parallel bootstrap failed:\n{exc}")
+            return
+
+        rep_metrics = []
+        shap_sum = np.zeros((n_samples, X.shape[1]), dtype=float)
+        shap_cnt = np.zeros(n_samples, dtype=int)
+        oob_hits = np.zeros(n_samples, dtype=int)
+        total_attempts = 0
+        for res in results:
+            if res is None:
+                continue
+            rep_metrics.append(res["metric"])
+            idx_oob = res["idx_oob"]
+            shap_sum[idx_oob] += res["shap_vals"]
+            shap_cnt[idx_oob] += 1
+            oob_hits[idx_oob] += 1
+            total_attempts += res["redraws"]
+
+        rep_metrics = np.asarray(rep_metrics, dtype=float)
+        accepted_reps = int(rep_metrics.size)
+        if accepted_reps == 0:
+            QMessageBox.warning(self, "Bootstrap", "No bootstrap replicates met the OOB criteria.")
+            return
+
+        perf_mean = float(np.mean(rep_metrics))
+        ci_lo, ci_hi = np.quantile(rep_metrics, [0.025, 0.975])
+        hits_min = int(np.min(oob_hits))
+        hits_med = float(np.median(oob_hits))
+        hits_mean = float(np.mean(oob_hits))
+
+        summary_text = (
+            f"=== {g_pos} vs {g_neg} ===\n"
+            f"AUC (OOB bootstrap): {perf_mean:.3f} [{ci_lo:.3f}, {ci_hi:.3f}] "
+            f"over {accepted_reps} reps (requested {bootstrap_reps})\n"
+            f"OOB hits - min/med/mean: {hits_min}/{hits_med:.1f}/{hits_mean:.1f}\n"
+            f"Tuned params: {best_params}\n"
+        )
+        self.te_cls.append(summary_text)
+
+        metrics_df = pd.DataFrame([
+            {
+                "metric": "AUC (bootstrap)",
+                "mean": round(perf_mean, 4),
+                "ci_low": round(ci_lo, 4),
+                "ci_high": round(ci_hi, 4),
+                "accepted_reps": accepted_reps,
+                "requested_reps": bootstrap_reps,
+            },
+            {
+                "metric": "OOB hits (min/med/mean)",
+                "mean": round(hits_mean, 2),
+                "ci_low": hits_min,
+                "ci_high": round(hits_med, 2),
+                "accepted_reps": hits_min,
+                "requested_reps": hits_med,
+            },
+        ])
+
+        has_oob = shap_cnt > 0
+        shap_avg = np.zeros_like(shap_sum)
+        shap_avg[has_oob] = shap_sum[has_oob] / np.maximum(shap_cnt[has_oob, None], 1)
+        shap_for_plot = shap_avg[has_oob]
+        X_for_plot = X.iloc[has_oob]
+
+        shap_df = None
+        if shap_for_plot.size:
+            mean_abs = np.mean(np.abs(shap_for_plot), axis=0)
+            mean_signed = np.mean(shap_for_plot, axis=0)
+            shap_df = (
+                pd.DataFrame({
+                    "feature": X.columns,
+                    "mean_abs_SHAP": mean_abs,
+                    "mean_SHAP": mean_signed,
+                })
+                .sort_values("mean_abs_SHAP", ascending=False)
+                .reset_index(drop=True)
+            )
+
+        self.populate_bootstrap_results(metrics_df, shap_df)
+
+        if shap_for_plot.size:
+            x_min = float(np.nanmin(shap_for_plot))
+            x_max = float(np.nanmax(shap_for_plot))
+            self._render_shap_summary(
+                shap_for_plot,
+                X_for_plot,
+                f"{g_pos} vs {g_neg}",
+                x_limits=(x_min, x_max),
+            )
+        else:
+            self.lbl_shap.setText("No SHAP data from bootstrap.")
 
 def main():
     app = QApplication(sys.argv)
