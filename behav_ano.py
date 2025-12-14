@@ -19,14 +19,14 @@ from PySide6.QtWidgets import (
     QFileDialog, QDockWidget, QFormLayout, QDoubleSpinBox, QSpinBox, QTabWidget, QListWidget,
     QListWidgetItem, QLineEdit, QMessageBox, QTextEdit, QComboBox, QProgressBar, QHeaderView,
     QGroupBox, QTableWidget, QTableWidgetItem, QAbstractScrollArea,
-    QSizePolicy, QAbstractItemView
+    QSizePolicy, QAbstractItemView, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsTextItem
 )
 import torch
 
 from ultralytics import YOLO
 
 import matplotlib.pyplot as plt
-
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import RepeatedStratifiedKFold, ParameterGrid, cross_val_score
 from sklearn.metrics import accuracy_score, roc_auc_score
@@ -540,6 +540,74 @@ class VideoPlayer(QWidget):
             self.label.setPixmap(pm.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 
+class ZoomableGraphicsView(QGraphicsView):
+    """Simple graphics view wrapper that supports wheel-based zoom and text placeholders."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item: Optional[QGraphicsPixmapItem] = None
+        self._text_item: Optional[QGraphicsTextItem] = None
+        self._zoom = 0
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setBackgroundBrush(Qt.white)
+
+    def setText(self, text: str):
+        self._scene.clear()
+        self._pixmap_item = None
+        self._text_item = self._scene.addText(text)
+        self._text_item.setDefaultTextColor(Qt.darkGray)
+        self._scene.setSceneRect(self._text_item.boundingRect())
+        self.resetTransform()
+        self._zoom = 0
+
+    def set_image(self, path: str):
+        pix = QPixmap(path)
+        if pix.isNull():
+            basename = os.path.basename(path) if path else "Image not available"
+            self.setText(basename)
+            return
+        self._scene.clear()
+        self._pixmap_item = self._scene.addPixmap(pix)
+        self._scene.setSceneRect(self._pixmap_item.boundingRect())
+        self.resetTransform()
+        self._zoom = 0
+        self._fit_in_view()
+
+    def wheelEvent(self, event):
+        if self._pixmap_item is None:
+            return super().wheelEvent(event)
+        zoom_in_factor = 1.25
+        zoom_out_factor = 1 / zoom_in_factor
+        if event.angleDelta().y() > 0:
+            self._zoom += 1
+            factor = zoom_in_factor
+        else:
+            self._zoom -= 1
+            factor = zoom_out_factor
+        if self._zoom > 0:
+            self.scale(factor, factor)
+        else:
+            self._zoom = 0
+            self._fit_in_view()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._pixmap_item is not None and self._zoom == 0:
+            self._fit_in_view()
+
+    def _fit_in_view(self):
+        if self._pixmap_item is None:
+            return
+        pix_rect = self._pixmap_item.boundingRect()
+        if pix_rect.isNull():
+            return
+        self.fitInView(pix_rect, Qt.KeepAspectRatio)
+
+
 # ======== Main window ========
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -704,10 +772,10 @@ class MainWindow(QMainWindow):
         self.tbl_shap_features.setRowCount(0)
         self.tbl_shap_features.setMinimumHeight(150)
         cl.addWidget(self.tbl_shap_features, 1)
-        self.lbl_shap = QLabel("SHAP summary will appear here")
-        self.lbl_shap.setAlignment(Qt.AlignCenter)
-        self.lbl_shap.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.lbl_shap = ZoomableGraphicsView()
+        self.lbl_shap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.lbl_shap.setMinimumSize(0, 0)
+        self.lbl_shap.setText("SHAP summary will appear here")
         cl.addWidget(self.lbl_shap, 1)
         self.tabs_main.addTab(tab_cls, "Classifier & SHAP")
 
@@ -1097,6 +1165,12 @@ class MainWindow(QMainWindow):
 
     def set_image_to_label(self, path: str, label: QLabel):
         if not os.path.isfile(path):
+            if hasattr(label, "setText"):
+                label.setText("Image not found")
+            return
+        if isinstance(label, ZoomableGraphicsView):
+            label.set_image(path)
+            label.setToolTip(path)
             return
         pix = QPixmap(path)
         if pix.isNull():
