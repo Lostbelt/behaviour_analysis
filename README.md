@@ -12,14 +12,16 @@ A GUI application for **YOLO Pose** inference and behavior analysis.
 
 Create an environment using yml file:
 ```bash
-conda env create -f environment.yml
-conda activate cv
+conda create -n lab_env Python=3.10
+conda activate lab_env
+
+git clone https://github.com/Lostbelt/behaviour_analysis.git
+cd behaviour_analysis
+pip install -e requirements.txt
 # for gpu inference needs cuda PyTorch (choose the wheel appropriate for your system/driver)
 # CUDA example:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
-
-> **Windows tip:** Install **PySide6 via pip** (not conda) to avoid Qt DLL conflicts.
 
 ---
 
