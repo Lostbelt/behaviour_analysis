@@ -13,7 +13,6 @@ filelock==3.20.0
 fonttools==4.60.1
 fsspec==2025.9.0
 gmpy2==2.2.1
-gxipy==2.0.2412.9191
 h5py==3.15.1
 idna==3.11
 ipykernel==7.1.0
@@ -78,3 +77,5 @@ urllib3==2.5.0
 wcwidth==0.2.14
 wheel==0.45.1
 xmltodict==1.0.2
+scikit-learn==1.7.2
+shap==0.49.1
