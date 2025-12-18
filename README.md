@@ -47,18 +47,4 @@ Typical workflow:
 
 You can download model weights and video examples on google drive [link](https://drive.google.com/drive/folders/19Ow9olyP1Yj2Pnr0URGYc5XFKusuZTtM?usp=sharing).
 
-
-## 📂 Outputs
-
-```
-runs/pose_app/<timestamp>/
-├─ annot_<video>.mp4
-├─ predictions_all.json          # merged predictions for the run
-├─ cache/
-│  └─ <video>_<hash>.json        # per-video intermediate cache
-├─ table_data.xlsx
-├─ combined_stats.png
-└─ shap_summary_<pair>.png       # if SHAP installed / classifier run
-```
-
 ---
