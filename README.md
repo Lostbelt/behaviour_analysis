@@ -10,7 +10,7 @@ A GUI application for **YOLO Pose** inference and behavior analysis.
 
 ## Installation
 
-Create an environment using yml file:
+Create an environment:
 ```bash
 conda create -n lab_env Python=3.10
 conda activate lab_env
