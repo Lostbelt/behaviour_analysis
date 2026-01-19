@@ -54,5 +54,5 @@ You can download model weights and video examples on google drive [link](https:/
 
 For creating custom datasets or fine-tuning the model with your own data, we recommend using our annotation tool.
 
-**[Pose Annotator](https://github.com/Lostbelt/pose_annotator)** - A convenient tool for annotating pose data and building custom datasets.
+**[Pose Annotator](https://github.com/Lostbelt/pose_annotator)**
 
